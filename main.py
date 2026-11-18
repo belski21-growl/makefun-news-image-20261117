@@ -1,125 +1,151 @@
 #!/usr/bin/env python3
-"""Copy the bundled news image to the output directory.
+"""Ship the round-2 front page (entry.png) to the output directory.
 
-Entry for make.fun competition news-image-20261117:
+make.fun competition news-image-20261117, round 2:
 "Sum up 17 November's world news in one image".
 
-The image is shipped in this repository as entry.png (JPEG bytes in a
-file named entry.png, which the competition rules allow: the format is
-told apart by the file's first bytes, not its name). This program only
-copies it to the output directory, deterministically, with no network
-access and no dependencies beyond the Python standard library.
+The repository holds the finished image as entry.png. Although the
+name says .png, the bytes are JPEG, which the competition rules allow:
+the format is told apart by the file's first bytes, not its name.
+This program's only job is to place an exact copy at
+$MAKEFUN_OUTPUT_DIR/entry.png (default /output). It uses the Python
+standard library only, performs no network access, and is fully
+deterministic: two runs produce byte-identical output.
 
-Output directory: the MAKEFUN_OUTPUT_DIR environment variable, or
-/output when it is not set.
+Safety: the source is authenticated before anything is written, and
+the copy is authenticated again afterwards. Either check failing
+aborts with a non-zero exit status and a message on stderr.
 """
 
 import hashlib
 import os
 import sys
 
-CHUNK_SIZE = 65536
-JPEG_SOI = b"\xff\xd8"  # JPEG start-of-image marker
-JPEG_EOI = b"\xff\xd9"  # JPEG end-of-image marker
+READ_SIZE = 1 << 16
+JPEG_START = b"\xff\xd8"
+JPEG_END = b"\xff\xd9"
 
 
-def source_path():
-    """Absolute path of the image shipped next to this program."""
+class Fingerprint:
+    """Size plus SHA-256 of one file, computed in a single stream."""
+
+    def __init__(self, size, sha256):
+        self.size = size
+        self.sha256 = sha256
+
+    def __eq__(self, other):
+        return (isinstance(other, Fingerprint)
+                and self.size == other.size
+                and self.sha256 == other.sha256)
+
+    def __repr__(self):
+        return "Fingerprint(size=%d, sha256=%s)" % (self.size, self.sha256)
+
+
+class ImageFile:
+    """A JPEG file on disk, with whole-image authentication."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def fingerprint(self):
+        """Return the file's Fingerprint, or raise ValueError.
+
+        The file must exist, hold at least the two JPEG markers, and
+        start with the SOI marker and end with the EOI marker. The
+        digest covers every byte, so a truncated or altered file can
+        never fingerprint the same as the shipped original.
+        """
+        try:
+            handle = open(self.path, "rb")
+        except OSError as exc:
+            raise ValueError("cannot open %s: %s" % (self.path, exc))
+        with handle:
+            head = handle.read(len(JPEG_START))
+            handle.seek(-len(JPEG_END), os.SEEK_END)
+            tail = handle.read(len(JPEG_END))
+            if head != JPEG_START:
+                raise ValueError("%s is not a JPEG (bad SOI marker)"
+                                 % self.path)
+            if tail != JPEG_END:
+                raise ValueError("%s is not a whole JPEG (bad EOI marker)"
+                                 % self.path)
+            handle.seek(0)
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                chunk = handle.read(READ_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                digest.update(chunk)
+        if total < len(JPEG_START) + len(JPEG_END):
+            raise ValueError("%s is too small to be a JPEG" % self.path)
+        return Fingerprint(total, digest.hexdigest())
+
+    def stream_into(self, destination):
+        """Copy the file to destination, hashing as bytes flow through.
+
+        Returns the Fingerprint of the bytes written, so the caller
+        can compare it against the source fingerprint without a
+        second read of either file.
+        """
+        digest = hashlib.sha256()
+        total = 0
+        with open(self.path, "rb") as reader, \
+                open(destination, "wb") as writer:
+            while True:
+                chunk = reader.read(READ_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                digest.update(chunk)
+                writer.write(chunk)
+        return Fingerprint(total, digest.hexdigest())
+
+
+def fail(message):
+    """Print an error and return the failure exit status."""
+    print("error: %s" % message, file=sys.stderr)
+    return 1
+
+
+def main(argv=None):
     here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, "entry.png")
-
-
-def sha256_of(path):
-    """SHA-256 hex digest of a file, read in chunks."""
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while True:
-            chunk = handle.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def verify_image(path):
-    """Check that a file is a whole JPEG image; return (size, sha256).
-
-    Raises ValueError with a clear message when the file is missing,
-    empty, or does not start and end with the JPEG markers.
-    """
-    if not os.path.isfile(path):
-        raise ValueError("image file not found: %s" % path)
-    size = os.path.getsize(path)
-    if size == 0:
-        raise ValueError("image file is empty: %s" % path)
-    if size < 2:
-        raise ValueError("image file too small to hold JPEG markers: %s"
-                         % path)
-    with open(path, "rb") as handle:
-        head = handle.read(2)
-        handle.seek(-2, os.SEEK_END)
-        tail = handle.read(2)
-    if head != JPEG_SOI:
-        raise ValueError(
-            "image does not start with the JPEG SOI marker: %s" % path
-        )
-    if tail != JPEG_EOI:
-        raise ValueError(
-            "image does not end with the JPEG EOI marker: %s" % path
-        )
-    return size, sha256_of(path)
-
-
-def copy_file(source, destination):
-    """Copy a file in fixed-size chunks."""
-    with open(source, "rb") as src, open(destination, "wb") as dst:
-        while True:
-            chunk = src.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            dst.write(chunk)
-
-
-def main():
-    source = source_path()
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    destination = os.path.join(out_dir, "entry.png")
-
+    source = ImageFile(os.path.join(here, "entry.png"))
     try:
-        src_size, src_sha256 = verify_image(source)
+        wanted = source.fingerprint()
     except (OSError, ValueError) as exc:
-        print("error: cannot use source image: %s" % exc, file=sys.stderr)
-        return 1
+        return fail("source image rejected: %s" % exc)
 
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     try:
         os.makedirs(out_dir, exist_ok=True)
     except OSError as exc:
-        print("error: cannot create output dir %s: %s" % (out_dir, exc),
-              file=sys.stderr)
-        return 1
+        return fail("cannot create output dir %s: %s" % (out_dir, exc))
 
+    destination = os.path.join(out_dir, "entry.png")
     try:
-        copy_file(source, destination)
+        written = source.stream_into(destination)
     except OSError as exc:
-        print("error: copy failed: %s" % exc, file=sys.stderr)
-        return 1
+        return fail("copy to %s failed: %s" % (destination, exc))
 
+    if written != wanted:
+        return fail("output mismatch: wrote %r, expected %r"
+                    % (written, wanted))
+
+    # Independent re-read of the delivered file: the strongest check,
+    # since it reads back what actually landed on disk.
     try:
-        dst_size, dst_sha256 = verify_image(destination)
+        delivered = ImageFile(destination).fingerprint()
     except (OSError, ValueError) as exc:
-        print("error: output image failed verification: %s" % exc,
-              file=sys.stderr)
-        return 1
-
-    if dst_size != src_size or dst_sha256 != src_sha256:
-        print("error: output differs from source "
-              "(size %d vs %d, sha256 %s vs %s)"
-              % (dst_size, src_size, dst_sha256, src_sha256),
-              file=sys.stderr)
-        return 1
+        return fail("delivered image rejected: %s" % exc)
+    if delivered != wanted:
+        return fail("delivered file differs from source: %r vs %r"
+                    % (delivered, wanted))
 
     print("wrote %s (%d bytes, sha256 %s)"
-          % (destination, dst_size, dst_sha256))
+          % (destination, delivered.size, delivered.sha256))
     return 0
 
 
